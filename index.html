@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DX Org Monthly Project Cost Report</title>
+<link href="https://cdn.datatables.net/v/dt/jq-3.7.0/jszip-3.10.1/dt-2.3.3/b-3.2.4/b-html5-3.2.4/datatables.min.css" rel="stylesheet" integrity="sha384-1gDdvyOb9ZKF33+h4sGnHCZzvUbtFGOSziYM8NsIjolmOHQqNGaRlNWJr/lRIufO" crossorigin="anonymous">
+  <style>
+    /* Layout: top-left (inputs, 1/3), top-right (info, 2/3), bottom (table) */
+    body { margin: 0; font-family: Arial, sans-serif; }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 2fr;
+      grid-template-rows: auto auto;
+      grid-template-areas:
+        "input info"
+        "bottom bottom";
+      gap: 12px;
+      padding: 12px;
+    }
+    .panel {
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 12px;
+      background: #fff;
+    }
+    .input-area { grid-area: input; background: #f9fafb; }
+    .info-area  { grid-area: info;  background: #f3f8ff; }
+    .bottom-area{ grid-area: bottom; background: #ffffff; }
+
+    .input-area label { display: block; margin-top: 8px; }
+    .input-area input { width: 320px; padding: 6px 8px; }
+    .input-area button { margin-top: 12px; padding: 8px 14px; cursor: pointer; }
+    .progress { margin-top: 10px; font-size: 14px; color: #555; }
+
+    .kv { line-height: 1.8; }
+    .errors { margin-top: 8px; color: #c00; }
+    .errors h4 { margin: 8px 0 4px 0; }
+    .errors ul { margin: 0; padding-left: 18px; }
+
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+    th { background: #f5f5f5; }
+    .muted { color: #777; }
+  </style>
+</head>
+<body>
+  <div class="grid">
+    <!-- Top-left: Inputs -->
+    <div class="panel input-area">
+      <h3>Input</h3>
+      <label>Token:
+        <input type="text" id="token" placeholder="Bearer token" />
+      </label>
+      <label>Org ID:
+        <input type="text" id="orgId" placeholder="e.g. org-xxxx" />
+      </label>
+      <label>Month (YYYYMM):
+        <input type="text" id="month" placeholder="e.g. 202508" />
+      </label>
+      <button id="fetchBtn">Fetch Report</button>
+      <div id="progress" class="progress"></div>
+    </div>
+
+    <!-- Top-right: Info + stacked errors -->
+    <div class="panel info-area">
+      <h3>Org Info</h3>
+      <div class="kv">
+        Org name: <span id="orgName" class="muted">-</span><br/>
+        Currency: <span id="currency" class="muted">-</span><br/>
+        Estimated spending limit left: <span id="limitLeft" class="muted">-</span><br/>
+        Total members retrieved: <span id="membersCount" class="muted">-</span><br/>
+        Total projects in org: <span id="projectsCount" class="muted">-</span><br/>
+        Total projects to which you have access: <span id="calculatedCount" class="muted">-</span>
+      </div>
+      <div class="errors">
+        <h4>Error messages</h4>
+        <ul id="errorList">(none)</ul>
+      </div>
+    </div>
+
+    <!-- Bottom: Table only -->
+    <div class="panel bottom-area">
+      <h3>Projects Cost Report</h3>
+      <div id="subtotals" class="kv" style="margin-top:8px; font-weight:bold;"></div>
+      <table id="resultsTable">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Project name</th>
+            <th>Created by</th>
+            <th>Created by user id</th>
+            <th id="storageCostHeader">Storage cost of the LATEST month, ESTIMATED</th>
+            <th>Your access to the project</th>
+            <th>N Jobs in the month</th>
+            <th id="jobsCostHeader">Jobs cost of the GIVEN month, ACTUAL</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/decimal.js/10.6.0/decimal.min.js" integrity="sha512-zSdNRgc1pHbY0WW2GUugq5Z3vs4JPmMatHp73oxcpGbxlq3guygwnuHYW1XXGWsmYKvcBPCUiZ4yAsVgAnTwxw==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdn.datatables.net/v/dt/jq-3.7.0/jszip-3.10.1/dt-2.3.3/b-3.2.4/b-html5-3.2.4/datatables.min.js" integrity="sha384-0nQHTDVJqwNebSkuQIpvy7TMvy1Rlrc0j3XU/q9J/5xFY/wpsSXoiQdXVDr2ML9Z" crossorigin="anonymous"></script>
+<script>
+  // --- Constants & helpers ---
+  const BASE_URL   = 'https://api.dnanexus.com';
+  const PAGE_LIMIT = 200;
+
+  /** Basic POST helper that returns the raw Response */
+  async function postRaw(url, token, body) {
+    return fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body || {})
+    });
+  }
+
+  /** POST and parse JSON (throws on non-ok) */
+  async function postJSON(url, token, body) {
+    const resp = await postRaw(url, token, body);
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(`HTTP ${resp.status} ${resp.statusText}${text ? ` - ${text}` : ''}`);
+    }
+    return resp.json();
+  }
+
+  /** Validate YYYYMM and return [fromMs, toMs] (UTC month first/last ms) */
+  function getMonthRangeUtc(yearMonth) {
+    if (!/^\d{6}$/.test(yearMonth)) throw new Error('Month must be YYYYMM.');
+    const year = parseInt(yearMonth.slice(0,4), 10);
+    const mm   = parseInt(yearMonth.slice(4,6), 10);
+    if (mm < 1 || mm > 12) throw new Error('Month must be between 01 and 12.');
+    const mIdx = mm - 1; // 0-based
+    const from = Date.UTC(year, mIdx, 1, 0, 0, 0, 0);
+    const to   = Date.UTC(year, mIdx + 1, 0, 23, 59, 59, 999);
+    return [from, to];
+  }
+
+  /** Generic paginator using 'starting'/'next' */
+  async function paginate(url, token, baseBody, onPage) {
+    let starting = null;
+    do {
+      const body = { ...baseBody, limit: PAGE_LIMIT };
+      if (starting) body.starting = starting;
+      const data = await postJSON(url, token, body);
+      if (Array.isArray(data.results)) {
+        await onPage(data.results);
+      }
+      starting = data.next ? data.next : null;
+    } while (starting);
+  }
+
+  /** Format to decimal places for display only */
+  function fmt(n, decimals = 3) {
+    if (typeof n !== 'number' || !isFinite(n)) return '';
+    return n.toFixed(decimals);
+  }
+
+  /** Safely append a list item to the No access list */
+  function pushError(msg) {
+    const ul = document.getElementById('errorList');
+    if (ul.textContent.trim() === '(none)') ul.textContent = '';
+    const li = document.createElement('li');
+    li.textContent = msg;
+    ul.appendChild(li);
+  }
+
+  // --- Main handler ---
+  document.getElementById('fetchBtn').addEventListener('click', async () => {
+    const token  = document.getElementById('token').value.trim();
+    const orgId  = document.getElementById('orgId').value.trim();
+    const ym     = document.getElementById('month').value.trim();
+
+    const progressDiv = document.getElementById('progress');
+    const tbody       = document.querySelector('#resultsTable tbody');
+    const errList     = document.getElementById('errorList');
+
+    // Reset UI
+    progressDiv.textContent = '';
+    if ( $.fn.DataTable.isDataTable('#resultsTable') ) {
+      $('#resultsTable').DataTable().clear().destroy();
+    }
+    tbody.innerHTML = '';
+    errList.innerHTML = '(none)';
+    document.getElementById('orgName').textContent   = '-';
+    document.getElementById('currency').textContent  = '-';
+    document.getElementById('limitLeft').textContent = '-';
+    document.getElementById('membersCount').textContent  = '-';
+    document.getElementById('projectsCount').textContent  = '-';
+    document.getElementById('calculatedCount').textContent= '-';
+    document.getElementById('subtotals').textContent = '';
+
+    if (!token || !orgId || !ym) {
+      progressDiv.textContent = 'Token, Org ID and Month are required.';
+      return;
+    }
+
+    // Compute range (UTC ms)
+    let rangeFrom, rangeTo;
+    try {
+      [rangeFrom, rangeTo] = getMonthRangeUtc(ym);
+    } catch (e) {
+      progressDiv.textContent = e.message;
+      return;
+    }
+
+    try {
+      // --- 1) Org describe ---
+      progressDiv.textContent = 'Fetching org info...';
+      const orgData = await postJSON(`${BASE_URL}/${orgId}/describe`, token, {});
+      const currencyCode = orgData?.currency?.code || '';
+      const limitLeftNum = typeof orgData?.estSpendingLimitLeft === 'number'
+        ? orgData.estSpendingLimitLeft
+        : null;
+
+      document.getElementById('orgName').textContent   = orgData?.name ?? '';
+      document.getElementById('currency').textContent  = currencyCode || '';
+      document.getElementById('limitLeft').textContent = (limitLeftNum != null) ? limitLeftNum.toFixed(2) : '';
+
+      // --- 2) Members -> build user map (id -> "First Last") ---
+      progressDiv.textContent = 'Fetching members...';
+      const userMap = {}; // userId -> full name
+      let membersCount = 0;
+      await paginate(`${BASE_URL}/${orgId}/findMembers`, token, {
+        describe: { first: true, last: true }
+      }, (results) => {
+        results.forEach(u => {
+          const id = u?.id;
+          const first = u?.describe?.first || '';
+          const last  = u?.describe?.last  || '';
+          if (id) userMap[id] = `${first} ${last}`.trim();
+        });
+        membersCount += results.length;
+      });
+      document.getElementById('membersCount').textContent = membersCount;
+
+      // --- 3) Projects ---
+      progressDiv.textContent = 'Fetching projects...';
+      const projectMap = {}; // projectId -> { name, createdByUserId, createdByFullName, storageCost, ... }
+      await paginate(`${BASE_URL}/${orgId}/findProjects`, token, {
+        describe: { fields: { name: true, storageCost: true, createdBy: true } }
+      }, (results) => {
+        results.forEach(p => {
+          const desc = p?.describe || {};
+          const pid  = desc?.id;
+          const createdByUserId = desc?.createdBy?.user || '';
+          if (pid) {
+            projectMap[pid] = {
+              id: pid,
+              name: desc?.name || '',
+              createdByUserId,
+              createdByFullName: userMap[createdByUserId] || '', // show full name if available, else empty
+              storageCost: typeof desc?.storageCost === 'number' ? desc.storageCost : 0,
+              jobsTotalCost: 0,  // numeric for display later
+              jobsCount: 0,
+              success: true      // cost info accessible?
+            };
+          }
+        });
+      });
+
+      const projectIds = Object.keys(projectMap);
+      // Per your definition: this equals the number of rows we will show in the table
+      document.getElementById('projectsCount').textContent = projectIds.length;
+
+      // --- 4) For each project, fetch executions (jobs) and sum within month ---
+      let calculatedYes = 0;
+
+      for (let i = 0; i < projectIds.length; i++) {
+        const pid = projectIds[i];
+        const proj = projectMap[pid];
+        let jobsTotal = new Decimal(0);
+        let jobsCount = 0;
+        let starting = null;
+        let jobsFetchedSoFar = 0;
+
+        // Update progress (project index & name)
+        progressDiv.textContent = `Processing project ${i+1}/${projectIds.length}: "${proj.name}"...`;
+
+        // Paginate /system/findExecutions
+        try {
+          do {
+            const body = {
+              project: pid,
+              created: { before: rangeTo },
+              describe: { fields: { stoppedRunning: true, totalPrice: true, subtotalPriceInfo: true, billTo: true } },
+              limit: PAGE_LIMIT
+            };
+            if (starting) body.starting = starting;
+
+            const resp = await postRaw(`${BASE_URL}/system/findExecutions`, token, body);
+
+            // Special handling for 401 (no access to this project's jobs)
+            if (resp.status === 401) {
+              proj.success = false;
+              pushError(`No access to ${proj.name} (${pid}), skipped`);
+              break; // stop paginating this project
+            }
+
+            if (!resp.ok) {
+              // For non-401 errors, abort the whole run (as they are unexpected)
+              const t = await resp.text().catch(() => '');
+              throw new Error(`HTTP ${resp.status} ${resp.statusText}${t ? ` - ${t}` : ''}`);
+            }
+
+            const data = await resp.json();
+            const results = Array.isArray(data.results) ? data.results : [];
+            jobsFetchedSoFar += results.length;
+
+            // Update per-project jobs progress
+            progressDiv.textContent =
+              `Processing project ${i+1}/${projectIds.length}: "${proj.name}", jobs fetched so far: ${jobsFetchedSoFar}`;
+
+            // Filter + sum: both stoppedRunning & totalPrice exist, and stoppedRunning within [rangeFrom, rangeTo]
+            for (const job of results) {
+              const d = job?.describe || {};
+              const stopped = d?.stoppedRunning;
+              const price   = d?.totalPrice;
+              if (d?.billTo === orgId && typeof stopped === 'number' && typeof price === 'number') {
+                if (stopped >= rangeFrom && stopped <= rangeTo) {
+                  jobsCount += 1;
+                  jobsTotal = jobsTotal.plus(new Decimal(price));
+                }
+              }
+            }
+
+            starting = data.next ? data.next : null;
+          } while (starting);
+        } catch (e) {
+          // Any other fatal error stops everything
+          progressDiv.textContent = `Fatal error on project "${proj.name}" (${pid}): ${e.message}`;
+          throw e;
+        }
+
+        // Save results
+        proj.jobsCount = proj.success ? jobsCount : 0; // keep numeric 0; display blank later if !success
+        proj.jobsTotalCost = proj.success ? jobsTotal.toNumber() : 0;
+        if (proj.success) calculatedYes += 1;
+      }
+
+      document.getElementById('calculatedCount').textContent = calculatedYes;
+
+      // --- 5) Render table ---
+      // --- Before rendering table ---
+
+      // --- Compute subtotals ---
+      let subtotalStorageAll = new Decimal(0);
+      let subtotalJobs = new Decimal(0);
+      const ymFormatted = ym.slice(0, 4) + '-' + ym.slice(4);
+      const now = new Date();
+      const latestMonth = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+      const reportTime = new Date().toLocaleString();
+
+      for (const pid of projectIds) {
+        const p = projectMap[pid];
+        subtotalStorageAll = subtotalStorageAll.plus(new Decimal(p.storageCost));
+        if (p.success) {
+          subtotalJobs = subtotalJobs.plus(new Decimal(p.jobsTotalCost));
+        }
+      }
+
+      let subtotalsHTML = "";
+      if (projectIds.length === calculatedYes) {
+        subtotalsHTML = `
+          <p>
+            Generated at ${reportTime}. <br>
+            Compute costs of the GIVEN month (${ymFormatted}): ${currencyCode} ${subtotalJobs.toFixed(3)}. <br>
+            Storage costs of the LATEST month (${latestMonth}): ${currencyCode} ${subtotalStorageAll.toFixed(3)}.
+          </p>`;
+      } else {
+        let missing = projectIds.length - calculatedYes;
+        subtotalsHTML = `
+          <p>
+            Generated at ${reportTime}. <br>
+            Compute costs of the GIVEN month (${ymFormatted}): ${currencyCode} ${subtotalJobs.toFixed(3)}. <br>
+            Storage costs of the LATEST month (${latestMonth}): ${currencyCode} ${subtotalStorageAll.toFixed(3)}. <br>
+            <span style="color:#a00;">
+              NOTE: Storage cost is complete for all projects, but compute cost is missing from ${missing} projects, so the total projects cost may not coincide with your invoice.
+            </span>
+          </p>`;
+      }
+
+      document.getElementById("subtotals").innerHTML = subtotalsHTML;
+
+      // Update headers with currency
+      document.getElementById('storageCostHeader').textContent = `Storage cost of the LATEST month ${latestMonth}, ESTIMATED, ${currencyCode}`;
+      document.getElementById('jobsCostHeader').textContent    = `Jobs cost of the GIVEN month ${ymFormatted}, ACTUAL, ${currencyCode}`;
+
+      // -- Render table
+      const tbodyOut = document.querySelector('#resultsTable tbody');
+      tbodyOut.innerHTML = '';
+      for (const pid of projectIds) {
+        const p = projectMap[pid];
+        const tr = document.createElement('tr');
+
+        // Compute project total only if cost info is available (Yes)
+        let jobsCountDisplay = '';
+        let jobsCostDisplay  = '';
+
+        if (p.success) {
+          const projectTotal = new Decimal(p.storageCost).plus(new Decimal(p.jobsTotalCost)).toNumber();
+          jobsCountDisplay = String(p.jobsCount);
+          jobsCostDisplay = fmt(p.jobsTotalCost);
+        } else {
+          // When 401: keep storage cost visible; leave jobs and project totals blank
+          jobsCountDisplay = '';
+          jobsCostDisplay  = '';
+        }
+
+        tr.innerHTML = `
+          <td>${p.id}</td>
+          <td>${p.name}</td>
+          <td>${p.createdByFullName || ''}</td>
+          <td>${p.createdByUserId || ''}</td>
+          <td>${fmt(p.storageCost)}</td>
+          <td>${p.success ? 'Yes' : 'No'}</td>
+          <td>${jobsCountDisplay}</td>
+          <td>${jobsCostDisplay}</td>
+        `;
+        tbodyOut.appendChild(tr);
+      }
+
+      progressDiv.textContent = 'Processing completed.';
+      $('#resultsTable').DataTable({
+        dom: '<"dt-layout-row"<"dt-layout-cell dt-start"l><"dt-layout-cell dt-center"f><"dt-layout-cell dt-end"B>>' +
+        't' +
+        '<"dt-layout-row"<"dt-layout-cell dt-start"i><"dt-layout-cell dt-end"p>>',
+        buttons: [
+          {
+            extend: 'excelHtml5',
+            text: 'Export to Excel',
+            title: `DX ${orgId} Cost Report ${ymFormatted}`,
+            messageTop: function () {
+              return document.querySelector('#subtotals').innerText; 
+            }
+          }
+        ]
+      });
+    } catch (err) {
+      // Unexpected fatal error (non-401): show in progress area
+      progressDiv.textContent = `Error: ${err.message}`;
+    }
+  });
+</script>
+</body>
+</html>
