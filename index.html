@@ -89,6 +89,7 @@
             <th>Project name</th>
             <th>Created by</th>
             <th>Created by user id</th>
+            <th>Property: budget_code</th>
             <th id="storageCostHeader">Storage cost of the LATEST month, ESTIMATED</th>
             <th>Your access to the project</th>
             <th>N Jobs in the month</th>
@@ -243,7 +244,7 @@
       progressDiv.textContent = 'Fetching projects...';
       const projectMap = {}; // projectId -> { name, createdByUserId, createdByFullName, storageCost, ... }
       await paginate(`${BASE_URL}/${orgId}/findProjects`, token, {
-        describe: { fields: { name: true, storageCost: true, createdBy: true } }
+        describe: { fields: { name: true, storageCost: true, createdBy: true, properties: true } }
       }, (results) => {
         results.forEach(p => {
           const desc = p?.describe || {};
@@ -256,6 +257,7 @@
               createdByUserId,
               createdByFullName: userMap[createdByUserId] || '', // show full name if available, else empty
               storageCost: typeof desc?.storageCost === 'number' ? desc.storageCost : 0,
+              budgetCode: desc?.properties.budget_code || '',
               jobsTotalCost: 0,  // numeric for display later
               jobsCount: 0,
               success: true      // cost info accessible?
@@ -417,6 +419,7 @@
           <td>${p.name}</td>
           <td>${p.createdByFullName || ''}</td>
           <td>${p.createdByUserId || ''}</td>
+          <td>${p.budgetCode || ''}</td>
           <td>${fmt(p.storageCost)}</td>
           <td>${p.success ? 'Yes' : 'No'}</td>
           <td>${jobsCountDisplay}</td>
